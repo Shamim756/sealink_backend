@@ -1,0 +1,7 @@
+{
+  "watch": ["*.js"],
+  "ignore": ["node_modules", "*.sql", "*.md"],
+  "signal": "SIGTERM",
+  "delay": "500",
+  "ext": "js,json"
+}
