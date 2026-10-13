@@ -56,6 +56,17 @@ function authMiddleware(req, res, next) {
   }
 }
 
+// Optional auth — doesn't fail if no token
+function optionalAuth(req, res, next) {
+  const header = req.headers.authorization;
+  if (header && header.startsWith('Bearer ')) {
+    try {
+      req.user = jwt.verify(header.split(' ')[1], JWT_SECRET);
+    } catch {}
+  }
+  next();
+}
+
 // ==========================================
 // SOCKET.IO
 // ==========================================
@@ -69,7 +80,6 @@ io.on('connection', (socket) => {
 
   socket.on('leave_listing', (listingId) => {
     socket.leave(`listing_${listingId}`);
-    console.log(`Socket ${socket.id} left listing_${listingId}`);
   });
 
   socket.on('disconnect', () => {
@@ -136,7 +146,6 @@ app.post('/auth/register', async (req, res) => {
       phone,
     });
   } catch (err) {
-    console.error('Register error:', err);
     res.status(500).json({ success: false, message: err.message });
   } finally {
     conn.release();
@@ -487,9 +496,9 @@ app.post('/listings', authMiddleware, async (req, res) => {
 });
 
 // ==========================================
-// LISTINGS — GET ALL (paginated)
+// LISTINGS — GET ALL (paginated) + reactions count
 // ==========================================
-app.get('/listings', async (req, res) => {
+app.get('/listings', optionalAuth, async (req, res) => {
   const conn = await pool.getConnection();
   try {
     const page = parseInt(req.query.page) || 1;
@@ -502,7 +511,9 @@ app.get('/listings', async (req, res) => {
         fl.description, fl.status, fl.created_at,
         fc.name_bn AS fish_name_bn, fc.name_en AS fish_name_en, fc.image_url AS fish_image,
         u.id AS supplier_id, u.name AS supplier_name, u.username AS supplier_username,
-        l.division, l.district, l.upazila
+        l.division, l.district, l.upazila,
+        (SELECT COUNT(*) FROM reactions r WHERE r.listing_id = fl.id AND r.type = 'LIKE') AS like_count,
+        (SELECT COUNT(*) FROM reactions r WHERE r.listing_id = fl.id AND r.type = 'DISLIKE') AS dislike_count
        FROM fish_listings fl
        JOIN fish_categories fc ON fl.fish_category_id = fc.id
        JOIN users u ON fl.supplier_id = u.id
@@ -517,23 +528,32 @@ app.get('/listings', async (req, res) => {
       'SELECT COUNT(*) AS total FROM fish_listings WHERE status = "AVAILABLE"'
     );
 
+    // If logged in, get user's reactions
+    let userReactions = {};
+    if (req.user) {
+      const listingIds = listings.map(l => l.id);
+      if (listingIds.length > 0) {
+        const [rows] = await conn.query(
+          'SELECT listing_id, type FROM reactions WHERE user_id = ? AND listing_id IN (?)',
+          [req.user.id, listingIds]
+        );
+        rows.forEach(r => { userReactions[r.listing_id] = r.type; });
+      }
+    }
+
     listings.forEach((l) => {
       if (l.image_urls) {
         try { l.image_urls = JSON.parse(l.image_urls); } catch { l.image_urls = []; }
       } else {
         l.image_urls = [];
       }
+      l.user_reaction = userReactions[l.id] || null;
     });
 
     res.json({
       success: true,
       listings,
-      pagination: {
-        page,
-        limit,
-        total,
-        totalPages: Math.ceil(total / limit),
-      },
+      pagination: { page, limit, total, totalPages: Math.ceil(total / limit) },
     });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
@@ -545,7 +565,7 @@ app.get('/listings', async (req, res) => {
 // ==========================================
 // LISTINGS — GET ONE
 // ==========================================
-app.get('/listings/:id', async (req, res) => {
+app.get('/listings/:id', optionalAuth, async (req, res) => {
   const conn = await pool.getConnection();
   try {
     const [listings] = await conn.query(
@@ -553,7 +573,9 @@ app.get('/listings/:id', async (req, res) => {
         fl.*,
         fc.name_bn AS fish_name_bn, fc.name_en AS fish_name_en,
         u.name AS supplier_name, u.username AS supplier_username,
-        l.division, l.district, l.upazila
+        l.division, l.district, l.upazila,
+        (SELECT COUNT(*) FROM reactions r WHERE r.listing_id = fl.id AND r.type = 'LIKE') AS like_count,
+        (SELECT COUNT(*) FROM reactions r WHERE r.listing_id = fl.id AND r.type = 'DISLIKE') AS dislike_count
        FROM fish_listings fl
        JOIN fish_categories fc ON fl.fish_category_id = fc.id
        JOIN users u ON fl.supplier_id = u.id
@@ -571,6 +593,16 @@ app.get('/listings/:id', async (req, res) => {
       try { listing.image_urls = JSON.parse(listing.image_urls); } catch { listing.image_urls = []; }
     } else {
       listing.image_urls = [];
+    }
+
+    // User's own reaction
+    listing.user_reaction = null;
+    if (req.user) {
+      const [r] = await conn.query(
+        'SELECT type FROM reactions WHERE user_id = ? AND listing_id = ?',
+        [req.user.id, req.params.id]
+      );
+      if (r.length > 0) listing.user_reaction = r[0].type;
     }
 
     res.json({ success: true, listing });
@@ -647,6 +679,77 @@ app.delete('/listings/:id', authMiddleware, async (req, res) => {
 });
 
 // ==========================================
+// REACTIONS — TOGGLE LIKE/DISLIKE
+// ==========================================
+app.post('/listings/:id/react', authMiddleware, async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    const { type } = req.body; // 'LIKE' or 'DISLIKE'
+    if (type !== 'LIKE' && type !== 'DISLIKE') {
+      return res.status(400).json({ success: false, message: 'Invalid reaction type' });
+    }
+
+    const listingId = req.params.id;
+
+    // Check existing reaction
+    const [existing] = await conn.query(
+      'SELECT id, type FROM reactions WHERE user_id = ? AND listing_id = ?',
+      [req.user.id, listingId]
+    );
+
+    let userReaction = null;
+
+    if (existing.length > 0) {
+      const current = existing[0];
+      if (current.type === type) {
+        // Same reaction → remove (toggle off)
+        await conn.query('DELETE FROM reactions WHERE id = ?', [current.id]);
+        userReaction = null;
+      } else {
+        // Different reaction → update
+        await conn.query('UPDATE reactions SET type = ? WHERE id = ?', [type, current.id]);
+        userReaction = type;
+      }
+    } else {
+      // New reaction
+      await conn.query(
+        'INSERT INTO reactions (user_id, listing_id, type) VALUES (?, ?, ?)',
+        [req.user.id, listingId, type]
+      );
+      userReaction = type;
+    }
+
+    // Get updated counts
+    const [[counts]] = await conn.query(
+      `SELECT 
+        (SELECT COUNT(*) FROM reactions WHERE listing_id = ? AND type = 'LIKE') AS likes,
+        (SELECT COUNT(*) FROM reactions WHERE listing_id = ? AND type = 'DISLIKE') AS dislikes`,
+      [listingId, listingId]
+    );
+
+    const payload = {
+      listingId: parseInt(listingId),
+      likes: counts.likes,
+      dislikes: counts.dislikes,
+    };
+
+    // Broadcast to everyone in the listing room
+    io.to(`listing_${listingId}`).emit('reaction_update', payload);
+
+    res.json({
+      success: true,
+      likes: counts.likes,
+      dislikes: counts.dislikes,
+      userReaction,
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  } finally {
+    conn.release();
+  }
+});
+
+// ==========================================
 // COMMENTS — GET
 // ==========================================
 app.get('/listings/:id/comments', async (req, res) => {
@@ -706,13 +809,98 @@ app.post('/listings/:id/comments', authMiddleware, async (req, res) => {
     );
 
     const newComment = rows[0];
-
-    // Broadcast real-time
     io.to(`listing_${req.params.id}`).emit('comment_added', newComment);
 
     res.status(201).json({ success: true, comment: newComment });
   } catch (err) {
-    console.error('Comment error:', err);
+    res.status(500).json({ success: false, message: err.message });
+  } finally {
+    conn.release();
+  }
+});
+
+// ==========================================
+// RATINGS — GET USER RATING
+// ==========================================
+app.get('/users/:id/rating', async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    const [[stats]] = await conn.query(
+      `SELECT 
+        COUNT(*) AS total,
+        COALESCE(AVG(score), 0) AS average
+       FROM ratings WHERE ratee_id = ?`,
+      [req.params.id]
+    );
+
+    const [reviews] = await conn.query(
+      `SELECT 
+        r.id, r.score, r.review, r.created_at,
+        u.id AS rater_id, u.name AS rater_name
+       FROM ratings r
+       JOIN users u ON r.rater_id = u.id
+       WHERE r.ratee_id = ?
+       ORDER BY r.created_at DESC
+       LIMIT 10`,
+      [req.params.id]
+    );
+
+    res.json({
+      success: true,
+      average: parseFloat(stats.average),
+      total: stats.total,
+      reviews,
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  } finally {
+    conn.release();
+  }
+});
+
+// ==========================================
+// RATINGS — SUBMIT
+// ==========================================
+app.post('/ratings', authMiddleware, async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    const { ratee_id, order_id, score, review } = req.body;
+
+    if (!ratee_id || !score) {
+      return res.status(400).json({ success: false, message: 'Ratee and score required' });
+    }
+    if (score < 1 || score > 5) {
+      return res.status(400).json({ success: false, message: 'Score must be 1-5' });
+    }
+    if (ratee_id === req.user.id) {
+      return res.status(400).json({ success: false, message: 'Cannot rate yourself' });
+    }
+
+    const [result] = await conn.query(
+      `INSERT INTO ratings (rater_id, ratee_id, order_id, score, review)
+       VALUES (?, ?, ?, ?, ?)`,
+      [req.user.id, ratee_id, order_id || null, score, review || null]
+    );
+
+    const [[stats]] = await conn.query(
+      `SELECT COALESCE(AVG(score), 0) AS average
+       FROM ratings WHERE ratee_id = ?`,
+      [ratee_id]
+    );
+
+    // Broadcast rating update
+    io.emit('rating_update', {
+      userId: ratee_id,
+      average: parseFloat(stats.average),
+    });
+
+    res.status(201).json({
+      success: true,
+      message: 'Rating submitted',
+      rating_id: result.insertId,
+      new_average: parseFloat(stats.average),
+    });
+  } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   } finally {
     conn.release();
