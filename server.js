@@ -56,7 +56,6 @@ function authMiddleware(req, res, next) {
   }
 }
 
-// Optional auth — doesn't fail if no token
 function optionalAuth(req, res, next) {
   const header = req.headers.authorization;
   if (header && header.startsWith('Bearer ')) {
@@ -75,11 +74,15 @@ io.on('connection', (socket) => {
 
   socket.on('join_listing', (listingId) => {
     socket.join(`listing_${listingId}`);
-    console.log(`Socket ${socket.id} joined listing_${listingId}`);
   });
 
   socket.on('leave_listing', (listingId) => {
     socket.leave(`listing_${listingId}`);
+  });
+
+  socket.on('join_user', (userId) => {
+    socket.join(`user_${userId}`);
+    console.log(`Socket ${socket.id} joined user_${userId}`);
   });
 
   socket.on('disconnect', () => {
@@ -386,7 +389,7 @@ app.get('/auth/check-username/:username', async (req, res) => {
 });
 
 // ==========================================
-// AUTH — ME (protected)
+// AUTH — ME
 // ==========================================
 app.get('/auth/me', authMiddleware, async (req, res) => {
   const conn = await pool.getConnection();
@@ -496,7 +499,7 @@ app.post('/listings', authMiddleware, async (req, res) => {
 });
 
 // ==========================================
-// LISTINGS — GET ALL (paginated) + reactions count
+// LISTINGS — GET ALL
 // ==========================================
 app.get('/listings', optionalAuth, async (req, res) => {
   const conn = await pool.getConnection();
@@ -528,7 +531,6 @@ app.get('/listings', optionalAuth, async (req, res) => {
       'SELECT COUNT(*) AS total FROM fish_listings WHERE status = "AVAILABLE"'
     );
 
-    // If logged in, get user's reactions
     let userReactions = {};
     if (req.user) {
       const listingIds = listings.map(l => l.id);
@@ -595,7 +597,6 @@ app.get('/listings/:id', optionalAuth, async (req, res) => {
       listing.image_urls = [];
     }
 
-    // User's own reaction
     listing.user_reaction = null;
     if (req.user) {
       const [r] = await conn.query(
@@ -679,19 +680,18 @@ app.delete('/listings/:id', authMiddleware, async (req, res) => {
 });
 
 // ==========================================
-// REACTIONS — TOGGLE LIKE/DISLIKE
+// REACTIONS
 // ==========================================
 app.post('/listings/:id/react', authMiddleware, async (req, res) => {
   const conn = await pool.getConnection();
   try {
-    const { type } = req.body; // 'LIKE' or 'DISLIKE'
+    const { type } = req.body;
     if (type !== 'LIKE' && type !== 'DISLIKE') {
       return res.status(400).json({ success: false, message: 'Invalid reaction type' });
     }
 
     const listingId = req.params.id;
 
-    // Check existing reaction
     const [existing] = await conn.query(
       'SELECT id, type FROM reactions WHERE user_id = ? AND listing_id = ?',
       [req.user.id, listingId]
@@ -702,16 +702,13 @@ app.post('/listings/:id/react', authMiddleware, async (req, res) => {
     if (existing.length > 0) {
       const current = existing[0];
       if (current.type === type) {
-        // Same reaction → remove (toggle off)
         await conn.query('DELETE FROM reactions WHERE id = ?', [current.id]);
         userReaction = null;
       } else {
-        // Different reaction → update
         await conn.query('UPDATE reactions SET type = ? WHERE id = ?', [type, current.id]);
         userReaction = type;
       }
     } else {
-      // New reaction
       await conn.query(
         'INSERT INTO reactions (user_id, listing_id, type) VALUES (?, ?, ?)',
         [req.user.id, listingId, type]
@@ -719,7 +716,6 @@ app.post('/listings/:id/react', authMiddleware, async (req, res) => {
       userReaction = type;
     }
 
-    // Get updated counts
     const [[counts]] = await conn.query(
       `SELECT 
         (SELECT COUNT(*) FROM reactions WHERE listing_id = ? AND type = 'LIKE') AS likes,
@@ -733,7 +729,6 @@ app.post('/listings/:id/react', authMiddleware, async (req, res) => {
       dislikes: counts.dislikes,
     };
 
-    // Broadcast to everyone in the listing room
     io.to(`listing_${listingId}`).emit('reaction_update', payload);
 
     res.json({
@@ -888,7 +883,6 @@ app.post('/ratings', authMiddleware, async (req, res) => {
       [ratee_id]
     );
 
-    // Broadcast rating update
     io.emit('rating_update', {
       userId: ratee_id,
       average: parseFloat(stats.average),
@@ -899,6 +893,284 @@ app.post('/ratings', authMiddleware, async (req, res) => {
       message: 'Rating submitted',
       rating_id: result.insertId,
       new_average: parseFloat(stats.average),
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  } finally {
+    conn.release();
+  }
+});
+
+// ==========================================
+// ORDERS — CREATE
+// ==========================================
+app.post('/orders', authMiddleware, async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    if (req.user.role !== 'BUYER') {
+      return res.status(403).json({ success: false, message: 'Only buyers can place orders' });
+    }
+
+    const {
+      listing_id,
+      quantity_kg,
+      delivery_date,
+      delivery_location_id,
+      notes,
+    } = req.body;
+
+    if (!listing_id || !quantity_kg) {
+      return res.status(400).json({ success: false, message: 'Listing and quantity required' });
+    }
+
+    // Fetch listing
+    const [listings] = await conn.query(
+      `SELECT id, supplier_id, quantity_kg, price_per_kg, fish_category_id, status
+       FROM fish_listings WHERE id = ?`,
+      [listing_id]
+    );
+
+    if (listings.length === 0) {
+      return res.status(404).json({ success: false, message: 'Listing not found' });
+    }
+
+    const listing = listings[0];
+
+    if (listing.status !== 'AVAILABLE') {
+      return res.status(400).json({ success: false, message: 'Listing not available' });
+    }
+
+    if (quantity_kg > parseFloat(listing.quantity_kg)) {
+      return res.status(400).json({
+        success: false,
+        message: `Only ${listing.quantity_kg} kg available`,
+      });
+    }
+
+    if (listing.supplier_id === req.user.id) {
+      return res.status(400).json({ success: false, message: 'Cannot order your own listing' });
+    }
+
+    const totalPrice = quantity_kg * parseFloat(listing.price_per_kg);
+
+    const [result] = await conn.query(
+      `INSERT INTO orders
+       (buyer_id, supplier_id, listing_id, total_price, delivery_date, delivery_location_id, status)
+       VALUES (?, ?, ?, ?, ?, ?, 'PENDING')`,
+      [
+        req.user.id,
+        listing.supplier_id,
+        listing_id,
+        totalPrice,
+        delivery_date || null,
+        delivery_location_id || null,
+      ]
+    );
+
+    const orderId = result.insertId;
+
+    await conn.query(
+      `INSERT INTO order_items (order_id, fish_category_id, quantity_kg, price_per_kg, subtotal)
+       VALUES (?, ?, ?, ?, ?)`,
+      [orderId, listing.fish_category_id, quantity_kg, listing.price_per_kg, totalPrice]
+    );
+
+    // Fetch buyer name for notification
+    const [buyers] = await conn.query('SELECT name FROM users WHERE id = ?', [req.user.id]);
+    const buyerName = buyers[0]?.name || 'A buyer';
+
+    // Notify supplier via socket
+    io.to(`user_${listing.supplier_id}`).emit('new_order', {
+      orderId,
+      buyerName,
+      totalPrice,
+      quantityKg: quantity_kg,
+    });
+
+    res.status(201).json({
+      success: true,
+      message: 'Order placed successfully',
+      order_id: orderId,
+      total_price: totalPrice,
+    });
+  } catch (err) {
+    console.error('Order create error:', err);
+    res.status(500).json({ success: false, message: err.message });
+  } finally {
+    conn.release();
+  }
+});
+
+// ==========================================
+// ORDERS — MY ORDERS
+// ==========================================
+app.get('/orders/my', authMiddleware, async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    let query, params;
+
+    if (req.user.role === 'BUYER') {
+      query = `
+        SELECT 
+          o.id, o.total_price, o.delivery_date, o.status, o.created_at,
+          o.listing_id, o.buyer_id, o.supplier_id,
+          fl.image_urls, fl.fish_category_id,
+          fc.name_bn AS fish_name_bn, fc.name_en AS fish_name_en,
+          u.name AS supplier_name, u.username AS supplier_username,
+          l.division, l.district, l.upazila
+        FROM orders o
+        JOIN fish_listings fl ON o.listing_id = fl.id
+        JOIN fish_categories fc ON fl.fish_category_id = fc.id
+        JOIN users u ON o.supplier_id = u.id
+        LEFT JOIN locations l ON o.delivery_location_id = l.id
+        WHERE o.buyer_id = ?
+        ORDER BY o.created_at DESC
+      `;
+      params = [req.user.id];
+    } else if (req.user.role === 'SUPPLIER') {
+      query = `
+        SELECT 
+          o.id, o.total_price, o.delivery_date, o.status, o.created_at,
+          o.listing_id, o.buyer_id, o.supplier_id,
+          fl.image_urls, fl.fish_category_id,
+          fc.name_bn AS fish_name_bn, fc.name_en AS fish_name_en,
+          u.name AS buyer_name, u.username AS buyer_username, u.phone AS buyer_phone,
+          l.division, l.district, l.upazila
+        FROM orders o
+        JOIN fish_listings fl ON o.listing_id = fl.id
+        JOIN fish_categories fc ON fl.fish_category_id = fc.id
+        JOIN users u ON o.buyer_id = u.id
+        LEFT JOIN locations l ON o.delivery_location_id = l.id
+        WHERE o.supplier_id = ?
+        ORDER BY o.created_at DESC
+      `;
+      params = [req.user.id];
+    } else {
+      return res.status(403).json({ success: false, message: 'Invalid role' });
+    }
+
+    const [orders] = await conn.query(query, params);
+
+    orders.forEach((o) => {
+      if (o.image_urls) {
+        try { o.image_urls = JSON.parse(o.image_urls); } catch { o.image_urls = []; }
+      } else {
+        o.image_urls = [];
+      }
+    });
+
+    res.json({ success: true, orders });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  } finally {
+    conn.release();
+  }
+});
+
+// ==========================================
+// ORDERS — GET ONE
+// ==========================================
+app.get('/orders/:id', authMiddleware, async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    const [orders] = await conn.query(
+      `SELECT 
+        o.*,
+        fl.image_urls, fl.fish_category_id, fl.price_per_kg,
+        fc.name_bn AS fish_name_bn, fc.name_en AS fish_name_en,
+        buyer.name AS buyer_name, buyer.username AS buyer_username, buyer.phone AS buyer_phone,
+        supplier.name AS supplier_name, supplier.username AS supplier_username, supplier.phone AS supplier_phone,
+        l.division, l.district, l.upazila
+       FROM orders o
+       JOIN fish_listings fl ON o.listing_id = fl.id
+       JOIN fish_categories fc ON fl.fish_category_id = fc.id
+       JOIN users buyer ON o.buyer_id = buyer.id
+       JOIN users supplier ON o.supplier_id = supplier.id
+       LEFT JOIN locations l ON o.delivery_location_id = l.id
+       WHERE o.id = ?`,
+      [req.params.id]
+    );
+
+    if (orders.length === 0) {
+      return res.status(404).json({ success: false, message: 'Order not found' });
+    }
+
+    const order = orders[0];
+
+    if (order.buyer_id !== req.user.id && order.supplier_id !== req.user.id) {
+      return res.status(403).json({ success: false, message: 'Access denied' });
+    }
+
+    if (order.image_urls) {
+      try { order.image_urls = JSON.parse(order.image_urls); } catch { order.image_urls = []; }
+    } else {
+      order.image_urls = [];
+    }
+
+    // Get items
+    const [items] = await conn.query(
+      `SELECT oi.*, fc.name_bn AS fish_name_bn, fc.name_en AS fish_name_en
+       FROM order_items oi
+       JOIN fish_categories fc ON oi.fish_category_id = fc.id
+       WHERE oi.order_id = ?`,
+      [req.params.id]
+    );
+
+    order.items = items;
+
+    res.json({ success: true, order });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  } finally {
+    conn.release();
+  }
+});
+
+// ==========================================
+// ORDERS — UPDATE STATUS (supplier only)
+// ==========================================
+app.put('/orders/:id/status', authMiddleware, async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    if (req.user.role !== 'SUPPLIER') {
+      return res.status(403).json({ success: false, message: 'Only suppliers can update status' });
+    }
+
+    const { status } = req.body;
+    const validStatuses = ['PENDING', 'CONFIRMED', 'IN_TRANSIT', 'DELIVERED', 'CANCELLED'];
+
+    if (!validStatuses.includes(status)) {
+      return res.status(400).json({ success: false, message: 'Invalid status' });
+    }
+
+    const [rows] = await conn.query(
+      'SELECT supplier_id, buyer_id, status FROM orders WHERE id = ?',
+      [req.params.id]
+    );
+
+    if (rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Order not found' });
+    }
+
+    if (rows[0].supplier_id !== req.user.id) {
+      return res.status(403).json({ success: false, message: 'Not your order' });
+    }
+
+    const oldStatus = rows[0].status;
+
+    await conn.query('UPDATE orders SET status = ? WHERE id = ?', [status, req.params.id]);
+
+    // Notify buyer
+    io.to(`user_${rows[0].buyer_id}`).emit('order_update', {
+      orderId: parseInt(req.params.id),
+      status,
+      oldStatus,
+    });
+
+    res.json({
+      success: true,
+      message: `Order status updated to ${status}`,
+      status,
     });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
@@ -955,7 +1227,6 @@ let serverInstance;
   });
 })();
 
-// Graceful shutdown
 const shutdown = (signal) => {
   console.log(`\n${signal} received. Closing server...`);
   if (serverInstance) {
