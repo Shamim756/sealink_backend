@@ -82,7 +82,6 @@ io.on('connection', (socket) => {
 
   socket.on('join_user', (userId) => {
     socket.join(`user_${userId}`);
-    console.log(`Socket ${socket.id} joined user_${userId}`);
   });
 
   socket.on('disconnect', () => {
@@ -499,7 +498,7 @@ app.post('/listings', authMiddleware, async (req, res) => {
 });
 
 // ==========================================
-// LISTINGS — GET ALL
+// LISTINGS — GET ALL (with FILTERS)
 // ==========================================
 app.get('/listings', optionalAuth, async (req, res) => {
   const conn = await pool.getConnection();
@@ -508,6 +507,46 @@ app.get('/listings', optionalAuth, async (req, res) => {
     const limit = parseInt(req.query.limit) || 10;
     const offset = (page - 1) * limit;
 
+    // Filter params
+    const fishCategoryId = req.query.fish_category_id;
+    const locationId = req.query.location_id;
+    const minPrice = req.query.min_price ? parseFloat(req.query.min_price) : null;
+    const maxPrice = req.query.max_price ? parseFloat(req.query.max_price) : null;
+    const search = req.query.search;
+
+    // Build WHERE clause
+    const conditions = ["fl.status = 'AVAILABLE'"];
+    const params = [];
+
+    if (fishCategoryId) {
+      conditions.push('fl.fish_category_id = ?');
+      params.push(fishCategoryId);
+    }
+
+    if (locationId) {
+      conditions.push('fl.location_id = ?');
+      params.push(locationId);
+    }
+
+    if (minPrice !== null) {
+      conditions.push('fl.price_per_kg >= ?');
+      params.push(minPrice);
+    }
+
+    if (maxPrice !== null) {
+      conditions.push('fl.price_per_kg <= ?');
+      params.push(maxPrice);
+    }
+
+    if (search && search.trim() !== '') {
+      conditions.push('(fc.name_bn LIKE ? OR fc.name_en LIKE ? OR fl.description LIKE ?)');
+      const searchPattern = `%${search.trim()}%`;
+      params.push(searchPattern, searchPattern, searchPattern);
+    }
+
+    const whereClause = conditions.join(' AND ');
+
+    // Fetch listings
     const [listings] = await conn.query(
       `SELECT 
         fl.id, fl.quantity_kg, fl.price_per_kg, fl.catch_date, fl.image_urls, fl.video_url,
@@ -521,16 +560,22 @@ app.get('/listings', optionalAuth, async (req, res) => {
        JOIN fish_categories fc ON fl.fish_category_id = fc.id
        JOIN users u ON fl.supplier_id = u.id
        LEFT JOIN locations l ON fl.location_id = l.id
-       WHERE fl.status = 'AVAILABLE'
+       WHERE ${whereClause}
        ORDER BY fl.created_at DESC
        LIMIT ? OFFSET ?`,
-      [limit, offset]
+      [...params, limit, offset]
     );
 
+    // Count total
     const [[{ total }]] = await conn.query(
-      'SELECT COUNT(*) AS total FROM fish_listings WHERE status = "AVAILABLE"'
+      `SELECT COUNT(*) AS total
+       FROM fish_listings fl
+       JOIN fish_categories fc ON fl.fish_category_id = fc.id
+       WHERE ${whereClause}`,
+      params
     );
 
+    // User reactions
     let userReactions = {};
     if (req.user) {
       const listingIds = listings.map(l => l.id);
@@ -916,14 +961,12 @@ app.post('/orders', authMiddleware, async (req, res) => {
       quantity_kg,
       delivery_date,
       delivery_location_id,
-      notes,
     } = req.body;
 
     if (!listing_id || !quantity_kg) {
       return res.status(400).json({ success: false, message: 'Listing and quantity required' });
     }
 
-    // Fetch listing
     const [listings] = await conn.query(
       `SELECT id, supplier_id, quantity_kg, price_per_kg, fish_category_id, status
        FROM fish_listings WHERE id = ?`,
@@ -975,11 +1018,9 @@ app.post('/orders', authMiddleware, async (req, res) => {
       [orderId, listing.fish_category_id, quantity_kg, listing.price_per_kg, totalPrice]
     );
 
-    // Fetch buyer name for notification
     const [buyers] = await conn.query('SELECT name FROM users WHERE id = ?', [req.user.id]);
     const buyerName = buyers[0]?.name || 'A buyer';
 
-    // Notify supplier via socket
     io.to(`user_${listing.supplier_id}`).emit('new_order', {
       orderId,
       buyerName,
@@ -994,7 +1035,6 @@ app.post('/orders', authMiddleware, async (req, res) => {
       total_price: totalPrice,
     });
   } catch (err) {
-    console.error('Order create error:', err);
     res.status(500).json({ success: false, message: err.message });
   } finally {
     conn.release();
@@ -1107,7 +1147,6 @@ app.get('/orders/:id', authMiddleware, async (req, res) => {
       order.image_urls = [];
     }
 
-    // Get items
     const [items] = await conn.query(
       `SELECT oi.*, fc.name_bn AS fish_name_bn, fc.name_en AS fish_name_en
        FROM order_items oi
@@ -1127,7 +1166,7 @@ app.get('/orders/:id', authMiddleware, async (req, res) => {
 });
 
 // ==========================================
-// ORDERS — UPDATE STATUS (supplier only)
+// ORDERS — UPDATE STATUS
 // ==========================================
 app.put('/orders/:id/status', authMiddleware, async (req, res) => {
   const conn = await pool.getConnection();
@@ -1160,7 +1199,6 @@ app.put('/orders/:id/status', authMiddleware, async (req, res) => {
 
     await conn.query('UPDATE orders SET status = ? WHERE id = ?', [status, req.params.id]);
 
-    // Notify buyer
     io.to(`user_${rows[0].buyer_id}`).emit('order_update', {
       orderId: parseInt(req.params.id),
       status,
