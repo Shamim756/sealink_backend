@@ -66,6 +66,22 @@ function optionalAuth(req, res, next) {
   next();
 }
 
+// Helper: Send Notification (DB + Socket)
+async function sendNotification(conn, userId, type, content) {
+  try {
+    const [result] = await conn.query(
+      `INSERT INTO notifications (user_id, type, content) VALUES (?, ?, ?)`,
+      [userId, type, content]
+    );
+    const [rows] = await conn.query('SELECT * FROM notifications WHERE id = ?', [result.insertId]);
+    
+    io.to(`user_${userId}`).emit('notification', rows[0]);
+    return rows[0];
+  } catch (err) {
+    console.error('Notification error:', err);
+  }
+}
+
 // ==========================================
 // SOCKET.IO
 // ==========================================
@@ -507,53 +523,40 @@ app.get('/listings', optionalAuth, async (req, res) => {
     const limit = parseInt(req.query.limit) || 10;
     const offset = (page - 1) * limit;
 
-    // Filter params
-    const fishCategoryId = req.query.fish_category_id;
-    const locationId = req.query.location_id;
-    const minPrice = req.query.min_price ? parseFloat(req.query.min_price) : null;
-    const maxPrice = req.query.max_price ? parseFloat(req.query.max_price) : null;
-    const search = req.query.search;
-
-    // Build WHERE clause
     const conditions = ["fl.status = 'AVAILABLE'"];
     const params = [];
 
-    if (fishCategoryId) {
+    if (req.query.fish_category_id) {
       conditions.push('fl.fish_category_id = ?');
-      params.push(fishCategoryId);
+      params.push(req.query.fish_category_id);
     }
-
-    if (locationId) {
+    if (req.query.location_id) {
       conditions.push('fl.location_id = ?');
-      params.push(locationId);
+      params.push(req.query.location_id);
     }
-
-    if (minPrice !== null) {
+    if (req.query.min_price) {
       conditions.push('fl.price_per_kg >= ?');
-      params.push(minPrice);
+      params.push(req.query.min_price);
     }
-
-    if (maxPrice !== null) {
+    if (req.query.max_price) {
       conditions.push('fl.price_per_kg <= ?');
-      params.push(maxPrice);
+      params.push(req.query.max_price);
     }
-
-    if (search && search.trim() !== '') {
+    if (req.query.search && req.query.search.trim() !== '') {
       conditions.push('(fc.name_bn LIKE ? OR fc.name_en LIKE ? OR fl.description LIKE ?)');
-      const searchPattern = `%${search.trim()}%`;
-      params.push(searchPattern, searchPattern, searchPattern);
+      const p = `%${req.query.search.trim()}%`;
+      params.push(p, p, p);
     }
 
     const whereClause = conditions.join(' AND ');
 
-    // Fetch listings
     const [listings] = await conn.query(
       `SELECT 
         fl.id, fl.quantity_kg, fl.price_per_kg, fl.catch_date, fl.image_urls, fl.video_url,
         fl.description, fl.status, fl.created_at,
         fc.name_bn AS fish_name_bn, fc.name_en AS fish_name_en, fc.image_url AS fish_image,
         u.id AS supplier_id, u.name AS supplier_name, u.username AS supplier_username,
-        l.division, l.district, l.upazila,
+        l.division, l.district, l.upazila, l.latitude, l.longitude,
         (SELECT COUNT(*) FROM reactions r WHERE r.listing_id = fl.id AND r.type = 'LIKE') AS like_count,
         (SELECT COUNT(*) FROM reactions r WHERE r.listing_id = fl.id AND r.type = 'DISLIKE') AS dislike_count
        FROM fish_listings fl
@@ -566,7 +569,6 @@ app.get('/listings', optionalAuth, async (req, res) => {
       [...params, limit, offset]
     );
 
-    // Count total
     const [[{ total }]] = await conn.query(
       `SELECT COUNT(*) AS total
        FROM fish_listings fl
@@ -575,14 +577,13 @@ app.get('/listings', optionalAuth, async (req, res) => {
       params
     );
 
-    // User reactions
     let userReactions = {};
     if (req.user) {
-      const listingIds = listings.map(l => l.id);
-      if (listingIds.length > 0) {
+      const ids = listings.map(l => l.id);
+      if (ids.length > 0) {
         const [rows] = await conn.query(
           'SELECT listing_id, type FROM reactions WHERE user_id = ? AND listing_id IN (?)',
-          [req.user.id, listingIds]
+          [req.user.id, ids]
         );
         rows.forEach(r => { userReactions[r.listing_id] = r.type; });
       }
@@ -620,7 +621,7 @@ app.get('/listings/:id', optionalAuth, async (req, res) => {
         fl.*,
         fc.name_bn AS fish_name_bn, fc.name_en AS fish_name_en,
         u.name AS supplier_name, u.username AS supplier_username,
-        l.division, l.district, l.upazila,
+        l.division, l.district, l.upazila, l.latitude, l.longitude,
         (SELECT COUNT(*) FROM reactions r WHERE r.listing_id = fl.id AND r.type = 'LIKE') AS like_count,
         (SELECT COUNT(*) FROM reactions r WHERE r.listing_id = fl.id AND r.type = 'DISLIKE') AS dislike_count
        FROM fish_listings fl
@@ -776,6 +777,11 @@ app.post('/listings/:id/react', authMiddleware, async (req, res) => {
 
     io.to(`listing_${listingId}`).emit('reaction_update', payload);
 
+    const [listings] = await conn.query('SELECT supplier_id FROM fish_listings WHERE id = ?', [listingId]);
+    if (listings.length > 0 && listings[0].supplier_id !== req.user.id) {
+      await sendNotification(conn, listings[0].supplier_id, 'LIKE', `Someone ${type === 'LIKE' ? 'liked' : 'disliked'} your listing.`);
+    }
+
     res.json({
       success: true,
       likes: counts.likes,
@@ -825,7 +831,7 @@ app.post('/listings/:id/comments', authMiddleware, async (req, res) => {
     }
 
     const [listings] = await conn.query(
-      'SELECT id FROM fish_listings WHERE id = ?',
+      'SELECT id, supplier_id FROM fish_listings WHERE id = ?',
       [req.params.id]
     );
     if (listings.length === 0) {
@@ -851,6 +857,10 @@ app.post('/listings/:id/comments', authMiddleware, async (req, res) => {
     const newComment = rows[0];
     io.to(`listing_${req.params.id}`).emit('comment_added', newComment);
 
+    if (listings[0].supplier_id !== req.user.id) {
+      await sendNotification(conn, listings[0].supplier_id, 'COMMENT', `${newComment.user_name} commented on your listing.`);
+    }
+
     res.status(201).json({ success: true, comment: newComment });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
@@ -866,9 +876,7 @@ app.get('/users/:id/rating', async (req, res) => {
   const conn = await pool.getConnection();
   try {
     const [[stats]] = await conn.query(
-      `SELECT 
-        COUNT(*) AS total,
-        COALESCE(AVG(score), 0) AS average
+      `SELECT COUNT(*) AS total, COALESCE(AVG(score), 0) AS average
        FROM ratings WHERE ratee_id = ?`,
       [req.params.id]
     );
@@ -933,6 +941,8 @@ app.post('/ratings', authMiddleware, async (req, res) => {
       average: parseFloat(stats.average),
     });
 
+    await sendNotification(conn, ratee_id, 'RATING', `You received a new ${score}-star rating.`);
+
     res.status(201).json({
       success: true,
       message: 'Rating submitted',
@@ -956,12 +966,7 @@ app.post('/orders', authMiddleware, async (req, res) => {
       return res.status(403).json({ success: false, message: 'Only buyers can place orders' });
     }
 
-    const {
-      listing_id,
-      quantity_kg,
-      delivery_date,
-      delivery_location_id,
-    } = req.body;
+    const { listing_id, quantity_kg, delivery_date, delivery_location_id } = req.body;
 
     if (!listing_id || !quantity_kg) {
       return res.status(400).json({ success: false, message: 'Listing and quantity required' });
@@ -982,14 +987,9 @@ app.post('/orders', authMiddleware, async (req, res) => {
     if (listing.status !== 'AVAILABLE') {
       return res.status(400).json({ success: false, message: 'Listing not available' });
     }
-
     if (quantity_kg > parseFloat(listing.quantity_kg)) {
-      return res.status(400).json({
-        success: false,
-        message: `Only ${listing.quantity_kg} kg available`,
-      });
+      return res.status(400).json({ success: false, message: `Only ${listing.quantity_kg} kg available` });
     }
-
     if (listing.supplier_id === req.user.id) {
       return res.status(400).json({ success: false, message: 'Cannot order your own listing' });
     }
@@ -1021,12 +1021,7 @@ app.post('/orders', authMiddleware, async (req, res) => {
     const [buyers] = await conn.query('SELECT name FROM users WHERE id = ?', [req.user.id]);
     const buyerName = buyers[0]?.name || 'A buyer';
 
-    io.to(`user_${listing.supplier_id}`).emit('new_order', {
-      orderId,
-      buyerName,
-      totalPrice,
-      quantityKg: quantity_kg,
-    });
+    await sendNotification(conn, listing.supplier_id, 'ORDER', `${buyerName} placed a new order (৳${totalPrice}).`);
 
     res.status(201).json({
       success: true,
@@ -1205,11 +1200,47 @@ app.put('/orders/:id/status', authMiddleware, async (req, res) => {
       oldStatus,
     });
 
+    await sendNotification(conn, rows[0].buyer_id, 'ORDER', `Your order #${req.params.id} is now ${status}.`);
+
     res.json({
       success: true,
       message: `Order status updated to ${status}`,
       status,
     });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  } finally {
+    conn.release();
+  }
+});
+
+// ==========================================
+// NOTIFICATIONS
+// ==========================================
+app.get('/notifications', authMiddleware, async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    const [rows] = await conn.query(
+      `SELECT * FROM notifications WHERE user_id = ? ORDER BY created_at DESC LIMIT 50`,
+      [req.user.id]
+    );
+    const [[{ unread }]] = await conn.query(
+      `SELECT COUNT(*) AS unread FROM notifications WHERE user_id = ? AND is_read = FALSE`,
+      [req.user.id]
+    );
+    res.json({ success: true, notifications: rows, unread });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  } finally {
+    conn.release();
+  }
+});
+
+app.put('/notifications/read', authMiddleware, async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    await conn.query('UPDATE notifications SET is_read = TRUE WHERE user_id = ?', [req.user.id]);
+    res.json({ success: true });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   } finally {
@@ -1244,7 +1275,6 @@ app.post('/upload/image', authMiddleware, upload.single('image'), async (req, re
 // START SERVER
 // ==========================================
 const PORT = process.env.PORT || 3000;
-
 let serverInstance;
 
 (async () => {
