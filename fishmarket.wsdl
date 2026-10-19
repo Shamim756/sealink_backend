@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<definitions name="FishMarketService"
+    targetNamespace="http://sealinkbd.com/fishmarket"
+    xmlns="http://schemas.xmlsoap.org/wsdl/"
+    xmlns:soap="http://schemas.xmlsoap.org/wsdl/soap/"
+    xmlns:tns="http://sealinkbd.com/fishmarket"
+    xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+
+    <types>
+        <xsd:schema targetNamespace="http://sealinkbd.com/fishmarket">
+            <xsd:element name="GetFishPriceRequest">
+                <xsd:complexType>
+                    <xsd:sequence>
+                        <xsd:element name="fishName" type="xsd:string" minOccurs="1"/>
+                    </xsd:sequence>
+                </xsd:complexType>
+            </xsd:element>
+            <xsd:element name="GetFishPriceResponse">
+                <xsd:complexType>
+                    <xsd:sequence>
+                        <xsd:element name="fishName" type="xsd:string"/>
+                        <xsd:element name="pricePerKg" type="xsd:float"/>
+                        <xsd:element name="availableQuantity" type="xsd:float"/>
+                        <xsd:element name="marketLocation" type="xsd:string"/>
+                        <xsd:element name="lastUpdated" type="xsd:string"/>
+                    </xsd:sequence>
+                </xsd:complexType>
+            </xsd:element>
+        </xsd:schema>
+    </types>
+
+    <message name="GetFishPriceInput">
+        <part name="parameters" element="tns:GetFishPriceRequest"/>
+    </message>
+    <message name="GetFishPriceOutput">
+        <part name="parameters" element="tns:GetFishPriceResponse"/>
+    </message>
+
+    <portType name="FishMarketPort">
+        <operation name="GetFishPrice">
+            <input message="tns:GetFishPriceInput"/>
+            <output message="tns:GetFishPriceOutput"/>
+        </operation>
+    </portType>
+
+    <binding name="FishMarketBinding" type="tns:FishMarketPort">
+        <soap:binding style="document" transport="http://schemas.xmlsoap.org/soap/http"/>
+        <operation name="GetFishPrice">
+            <soap:operation soapAction="GetFishPrice"/>
+            <input>
+                <soap:body use="literal"/>
+            </input>
+            <output>
+                <soap:body use="literal"/>
+            </output>
+        </operation>
+    </binding>
+
+    <service name="FishMarketService">
+        <port name="FishMarketPort" binding="tns:FishMarketBinding">
+            <soap:address location="http://localhost:8000/wsdl"/>
+        </port>
+    </service>
+</definitions>
