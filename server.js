@@ -426,6 +426,111 @@ app.get('/auth/me', authMiddleware, async (req, res) => {
 });
 
 // ==========================================
+// ADMIN LOGIN
+// ==========================================
+app.post('/admin/login', async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    const { username, password } = req.body;
+    
+    const [users] = await conn.query(
+      'SELECT * FROM users WHERE (username = ? OR email = ?) AND role = "ADMIN" LIMIT 1',
+      [username, username]
+    );
+    
+    if (users.length === 0) {
+      return res.status(401).json({ success: false, message: 'Admin not found' });
+    }
+    
+    const user = users[0];
+    const ok = await bcrypt.compare(password, user.password_hash);
+    
+    if (!ok) {
+      return res.status(401).json({ success: false, message: 'Invalid credentials' });
+    }
+    
+    const token = jwt.sign(
+      { id: user.id, username: user.username, role: user.role },
+      JWT_SECRET,
+      { expiresIn: '7d' }
+    );
+    
+    delete user.password_hash;
+    res.json({ success: true, token, user });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  } finally {
+    conn.release();
+  }
+});
+
+// ==========================================
+// ADMIN STATS
+// ==========================================
+app.get('/admin/stats', authMiddleware, async (req, res) => {
+  if (req.user.role !== 'ADMIN') return res.status(403).json({ success: false, message: 'Admin access only' });
+  const conn = await pool.getConnection();
+  try {
+    const [[users]] = await conn.query('SELECT COUNT(*) AS count FROM users WHERE role != "ADMIN"');
+    const [[listings]] = await conn.query('SELECT COUNT(*) AS count FROM fish_listings');
+    const [[orders]] = await conn.query('SELECT COUNT(*) AS count FROM orders');
+    const [[revenue]] = await conn.query('SELECT COALESCE(SUM(total_price), 0) AS total FROM orders WHERE status = "DELIVERED"');
+    
+    res.json({
+      success: true,
+      stats: {
+        totalUsers: users.count,
+        totalListings: listings.count,
+        totalOrders: orders.count,
+        totalRevenue: parseFloat(revenue.total)
+      }
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  } finally {
+    conn.release();
+  }
+});
+
+// ==========================================
+// ADMIN — USERS LIST
+// ==========================================
+app.get('/admin/users', authMiddleware, async (req, res) => {
+  if (req.user.role !== 'ADMIN') return res.status(403).json({ success: false, message: 'Admin only' });
+  const conn = await pool.getConnection();
+  try {
+    const [users] = await conn.query('SELECT id, name, username, email, role, created_at FROM users WHERE role != "ADMIN" ORDER BY created_at DESC LIMIT 20');
+    res.json({ success: true, users });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  } finally {
+    conn.release();
+  }
+});
+
+// ==========================================
+// ADMIN — LISTINGS LIST
+// ==========================================
+app.get('/admin/listings', authMiddleware, async (req, res) => {
+  if (req.user.role !== 'ADMIN') return res.status(403).json({ success: false, message: 'Admin only' });
+  const conn = await pool.getConnection();
+  try {
+    const [listings] = await conn.query(`
+      SELECT fl.id, fl.quantity_kg, fl.price_per_kg, fc.name_bn AS fish_name_bn, u.name AS supplier_name
+      FROM fish_listings fl
+      JOIN fish_categories fc ON fl.fish_category_id = fc.id
+      JOIN users u ON fl.supplier_id = u.id
+      ORDER BY fl.created_at DESC LIMIT 20
+    `);
+    res.json({ success: true, listings });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  } finally {
+    conn.release();
+  }
+});
+
+// ==========================================
 // FISH CATEGORIES
 // ==========================================
 app.get('/fish-categories', async (req, res) => {
