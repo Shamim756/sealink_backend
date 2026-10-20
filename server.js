@@ -1,3 +1,5 @@
+const { graphqlHTTP } = require('express-graphql');
+const { schema, root } = require('./graphql-schema');
 const express = require('express');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
@@ -1379,6 +1381,16 @@ app.post('/upload/image', authMiddleware, upload.single('image'), async (req, re
 // ==========================================
 // START SERVER
 // ==========================================
+
+// ==========================================
+// GRAPHQL ENDPOINT
+// ==========================================
+app.use('/graphql', graphqlHTTP({
+  schema: schema,
+  rootValue: root,
+  graphiql: true, // ব্রাউজারে টেস্ট করার জন্য UI
+}));
+
 const PORT = process.env.PORT || 3000;
 let serverInstance;
 
